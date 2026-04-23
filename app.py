@@ -1,22 +1,33 @@
 import streamlit as st
 import pandas as pd
-import re
+import bibtexparser
 from io import BytesIO
+import re
 from difflib import SequenceMatcher
 
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Keyword Cleaner", layout="wide")
+OUTPUT_COLUMNS = [
+    "Title","Authors","Author full names","Affiliations",
+    "DE","ID","DE_ID","Keyword_Source",
+    "References","DOI","Year","Source title",
+    "Volume","Issue","Page start","Page end"
+]
 
 # =========================
-# BASIC CLEAN
+# CLEAN
 # =========================
 def clean_text(x):
     if pd.isna(x):
         return ""
     x = str(x).strip().lower()
-    x = re.sub(r"\s+", " ", x)
+    x = re.sub(r"\s+"," ",x)
+    return x
+
+def clean_doi(x):
+    x = clean_text(x)
+    x = x.replace("https://doi.org/","").replace("doi:","")
     return x
 
 def normalize_keywords(text):
@@ -26,218 +37,217 @@ def normalize_keywords(text):
     parts = [clean_text(p) for p in text.split(";") if p.strip()]
     return "; ".join(sorted(set(parts)))
 
-# =========================
-# KEYWORD MERGE
-# =========================
-def merge_keywords(de, id_):
-    return normalize_keywords(de + ";" + id_)
+def merge_kw(de,id_):
+    return normalize_keywords(de+";"+id_)
+
+def detect_source(de,id_):
+    if de and id_:
+        return "DE+ID"
+    if de:
+        return "DE"
+    if id_:
+        return "ID"
+    return "None"
 
 # =========================
-# FILE EXPORT
+# READ FILE
 # =========================
-def to_csv_bytes(df):
-    buffer = BytesIO()
-    df.to_csv(buffer, index=False, encoding="utf-8-sig")
-    return buffer.getvalue()
-
-# =========================
-# SIMILARITY (OPTIMIZED)
-# =========================
-def suggest_keywords(df, min_count=2, threshold=0.9, max_terms=300):
-    keywords = []
-
-    for val in df["DE_ID"]:
-        if val:
-            keywords += val.split(";")
-
-    freq = pd.Series(keywords).value_counts()
-    freq = freq[freq >= min_count]
-
-    # LIMIT để tránh O(n^2) quá lớn
-    terms = freq.index.tolist()[:max_terms]
-
-    rows = []
-
-    for i in range(len(terms)):
-        for j in range(i + 1, len(terms)):
-            k1 = terms[i]
-            k2 = terms[j]
-
-            sim = SequenceMatcher(None, k1, k2).ratio()
-
-            if sim >= threshold:
-                rows.append({
-                    "Use": False,
-                    "Original": k2,
-                    "Suggested": k1,
-                    "Similarity": round(sim, 3)
-                })
-
-    return pd.DataFrame(rows)
+def read_file(file):
+    ext = file.name.split(".")[-1]
+    if ext=="bib":
+        bib = bibtexparser.load(file)
+        rows=[]
+        for e in bib.entries:
+            rows.append({
+                "Title":e.get("title",""),
+                "Authors":e.get("author",""),
+                "DE":e.get("keywords",""),
+                "ID":e.get("keywords-plus",""),
+                "DOI":e.get("doi",""),
+                "Year":e.get("year","")
+            })
+        return pd.DataFrame(rows)
+    elif ext=="csv":
+        return pd.read_csv(file)
+    else:
+        return pd.read_excel(file)
 
 # =========================
-# APPLY MAPPING
+# STANDARDIZE
 # =========================
-def apply_mapping(df, mapping):
-    def replace_func(text):
-        if not text:
-            return ""
-        parts = text.split(";")
-        new = []
-        for p in parts:
-            p = p.strip()
-            p = mapping.get(p, p)
-            new.append(p)
-        return "; ".join(sorted(set(new)))
-
+def standardize(df):
     df = df.copy()
-    df["DE"] = df["DE"].apply(replace_func)
-    df["ID"] = df["ID"].apply(replace_func)
-    df["DE_ID"] = df.apply(lambda r: merge_keywords(r["DE"], r["ID"]), axis=1)
+
+    df["DOI"] = df.get("DOI","").apply(clean_doi)
+    df["Title"] = df.get("Title","").apply(clean_text)
+    df["Year"] = pd.to_numeric(df.get("Year",""),errors="coerce")
+
+    df["DE"] = df.get("DE","").apply(normalize_keywords)
+    df["ID"] = df.get("ID","").apply(normalize_keywords)
+
+    df["DE_ID"] = df.apply(lambda r: merge_kw(r["DE"],r["ID"]),axis=1)
+    df["Keyword_Source"] = df.apply(lambda r: detect_source(r["DE"],r["ID"]),axis=1)
 
     return df
 
 # =========================
-# SESSION
+# MERGE DOI
 # =========================
-if "data" not in st.session_state:
-    st.session_state.data = None
+def merge_data(df1,df2):
+    m = pd.merge(df1,df2,on="DOI",how="outer",suffixes=("_1","_2"))
 
-if "suggest" not in st.session_state:
-    st.session_state.suggest = None
+    out = pd.DataFrame()
+    out["DOI"]=m["DOI"]
 
-if "mapping" not in st.session_state:
-    st.session_state.mapping = {}
+    for col in ["Title","Authors","Year"]:
+        c1=col+"_1"
+        c2=col+"_2"
+        if c1 in m and c2 in m:
+            out[col]=m[c1].combine_first(m[c2])
+        elif c1 in m:
+            out[col]=m[c1]
+        else:
+            out[col]=m[c2]
 
-if "final" not in st.session_state:
-    st.session_state.final = None
+    out["DE"]=m.apply(lambda r: merge_kw(r.get("DE_1",""),r.get("DE_2","")),axis=1)
+    out["ID"]=m.apply(lambda r: merge_kw(r.get("ID_1",""),r.get("ID_2","")),axis=1)
+    out["DE_ID"]=out.apply(lambda r: merge_kw(r["DE"],r["ID"]),axis=1)
+
+    return out
+
+# =========================
+# SUGGEST
+# =========================
+def suggest(df,min_count=2,threshold=0.9,max_terms=300):
+    kws=[]
+    for v in df["DE_ID"]:
+        if v:
+            kws+=v.split(";")
+
+    freq=pd.Series(kws).value_counts()
+    freq=freq[freq>=min_count]
+
+    terms=freq.index[:max_terms]
+
+    rows=[]
+    for i in range(len(terms)):
+        for j in range(i+1,len(terms)):
+            s=SequenceMatcher(None,terms[i],terms[j]).ratio()
+            if s>=threshold:
+                rows.append({
+                    "Use":False,
+                    "Original":terms[j],
+                    "Suggested":terms[i],
+                    "Similarity":round(s,3)
+                })
+    return pd.DataFrame(rows)
+
+# =========================
+# APPLY
+# =========================
+def apply_map(df,map_):
+    def f(text):
+        if not text:
+            return ""
+        parts=text.split(";")
+        new=[map_.get(p.strip(),p.strip()) for p in parts]
+        return "; ".join(sorted(set(new)))
+    df=df.copy()
+    df["DE"]=df["DE"].apply(f)
+    df["ID"]=df["ID"].apply(f)
+    df["DE_ID"]=df.apply(lambda r: merge_kw(r["DE"],r["ID"]),axis=1)
+    return df
+
+# =========================
+# EXPORT
+# =========================
+def to_csv(df):
+    b=BytesIO()
+    df.to_csv(b,index=False,encoding="utf-8-sig")
+    return b.getvalue()
 
 # =========================
 # UI
 # =========================
-st.title("📘 Keyword Normalization Tool")
+st.set_page_config(layout="wide")
+st.title("📘 ISI + Scopus Keyword Tool")
 
 # =========================
-# STEP 1 UPLOAD
+# UPLOAD
 # =========================
-st.header("1. Upload data")
+isi = st.file_uploader("ISI file",type=["bib","csv","xlsx"])
+scopus = st.file_uploader("Scopus file",type=["csv","xlsx"])
 
-file = st.file_uploader("Upload CSV (Scopus/ISI merged)", type=["csv"])
+if isi and scopus:
 
-if file:
-    df = pd.read_csv(file)
+    df1 = standardize(read_file(isi))
+    df2 = standardize(read_file(scopus))
 
-    df["DE"] = df.get("DE", "")
-    df["ID"] = df.get("ID", "")
+    merged = merge_data(df1,df2)
 
-    df["DE"] = df["DE"].apply(normalize_keywords)
-    df["ID"] = df["ID"].apply(normalize_keywords)
+    st.session_state["base"]=merged
 
-    df["DE_ID"] = df.apply(lambda r: merge_keywords(r["DE"], r["ID"]), axis=1)
-
-    st.session_state.data = df
-
-    st.success("Loaded!")
-    st.dataframe(df.head(10))
+    st.success("Merged done")
+    st.dataframe(merged.head(10))
 
 # =========================
-# STEP 2 SUGGEST
+# SUGGEST
 # =========================
-if st.session_state.data is not None:
+if "base" in st.session_state:
 
-    st.header("2. Generate keyword suggestions")
+    st.header("Suggest keywords")
 
-    col1, col2 = st.columns(2)
+    if st.button("Generate"):
+        st.session_state["suggest"]=suggest(st.session_state["base"])
 
-    with col1:
-        min_count = st.number_input("Min occurrence", 1, 10, 2)
+    if "suggest" in st.session_state:
+        edit = st.data_editor(st.session_state["suggest"],use_container_width=True)
 
-    with col2:
-        threshold = st.slider("Similarity", 0.8, 0.98, 0.9)
+        if st.button("Apply"):
+            mp={}
+            for _,r in edit.iterrows():
+                if r["Use"]:
+                    mp[r["Original"]]=r["Suggested"]
 
-    if st.button("Generate suggestions"):
-        with st.spinner("Processing..."):
-            st.session_state.suggest = suggest_keywords(
-                st.session_state.data,
-                min_count=min_count,
-                threshold=threshold
-            )
-
-    if st.session_state.suggest is not None:
-        st.dataframe(st.session_state.suggest, height=300)
+            st.session_state["map"]=mp
+            st.session_state["final"]=apply_map(st.session_state["base"],mp)
 
 # =========================
-# STEP 3 EDIT + APPLY
+# STEP 4 UI GỌN
 # =========================
-if st.session_state.suggest is not None:
+if "final" in st.session_state:
 
-    st.header("3. Edit mapping")
+    st.subheader("Kết quả cuối")
+    final = st.session_state["final"]
 
-    edited = st.data_editor(
-        st.session_state.suggest,
-        num_rows="dynamic",
-        use_container_width=True
-    )
+    st.dataframe(final.head(10))
 
-    if st.button("Apply mapping"):
-        mapping = {}
-
-        for _, row in edited.iterrows():
-            if row["Use"]:
-                mapping[row["Original"]] = row["Suggested"]
-
-        st.session_state.mapping = mapping
-        st.session_state.final = apply_mapping(st.session_state.data, mapping)
-
-        st.success(f"Applied {len(mapping)} mappings")
-
-# =========================
-# STEP 4 RESULT + DOWNLOAD
-# =========================
-if st.session_state.final is not None:
-
-    st.header("4. Result")
-
-    st.dataframe(st.session_state.final.head(15))
-
-    with st.expander("📥 Download & usage guide"):
+    with st.expander("📥 Tải file và hướng dẫn"):
 
         st.markdown("""
-### File explanation
-
-**Merged file**
-→ full dataset for analysis  
-
-**VOSviewer file**
-→ use for visualization  
-
-**Mapping table**
-→ editable mapping  
-
-**Approved mapping**
-→ final thesaurus  
+**Merged:** dữ liệu đầy đủ  
+**VOSviewer:** dùng vẽ bản đồ  
+**Mapping:** bảng chỉnh sửa  
+**Approved:** mapping cuối  
 """)
 
-        merged_csv = to_csv_bytes(st.session_state.final)
+        csv1 = to_csv(final)
 
-        vos = st.session_state.final.copy()
-        vos["Author Keywords"] = vos["DE_ID"]
-        vos_csv = to_csv_bytes(vos)
+        vos = final.copy()
+        vos["Author Keywords"]=vos["DE_ID"]
+        csv2 = to_csv(vos)
 
-        mapping_df = pd.DataFrame([
-            {"Original": k, "Suggested": v}
-            for k, v in st.session_state.mapping.items()
+        map_df = pd.DataFrame([
+            {"Original":k,"Suggested":v}
+            for k,v in st.session_state.get("map",{}).items()
         ])
+        csv3 = to_csv(map_df)
 
-        mapping_csv = to_csv_bytes(mapping_df)
+        c1,c2,c3 = st.columns(3)
 
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.download_button("Merged", merged_csv, "merged.csv")
-
-        with col2:
-            st.download_button("VOSviewer", vos_csv, "vosviewer.csv")
-
-        with col3:
-            st.download_button("Mapping", mapping_csv, "mapping.csv")
+        with c1:
+            st.download_button("Merged",csv1,"merged.csv")
+        with c2:
+            st.download_button("VOS",csv2,"vos.csv")
+        with c3:
+            st.download_button("Mapping",csv3,"mapping.csv")
