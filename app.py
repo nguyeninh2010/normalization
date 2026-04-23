@@ -838,68 +838,98 @@ if isi_file and scopus_file:
                     st.session_state["approved_mapping"] = {}
                     st.session_state["merged_final"] = st.session_state["merged_base"].copy()
                     st.success("Đã reset mapping áp dụng.")
+st.subheader("Bước 4. Kết quả cuối")
 
-        st.subheader("Bước 4. Kết quả cuối và xuất file")
+if st.session_state["merged_final"] is None:
+    st.session_state["merged_final"] = st.session_state["merged_base"].copy()
 
-        if st.session_state["merged_final"] is None:
-            st.session_state["merged_final"] = st.session_state["merged_base"].copy()
+merged_final = st.session_state["merged_final"].copy()
 
-        merged_final = st.session_state["merged_final"].copy()
+st.write("Số mapping đang áp dụng:", len(st.session_state["approved_mapping"]))
+st.write("Tổng số bản ghi:", len(merged_final))
 
-        st.write("Số mapping đang áp dụng:", len(st.session_state["approved_mapping"]))
-        st.write("Tổng số bản ghi:", len(merged_final))
-        st.write("Có DE:", int((merged_final["DE"] != "").sum()))
-        st.write("Có ID:", int((merged_final["ID"] != "").sum()))
-        st.write("Có DE_ID:", int((merged_final["DE_ID"] != "").sum()))
+st.dataframe(merged_final.head(15), use_container_width=True)
 
-        st.dataframe(merged_final.head(20), use_container_width=True)
+# =========================
+# EXPANDER TẢI FILE (GỌN UI)
+# =========================
+with st.expander("📥 Tải file và hướng dẫn sử dụng", expanded=False):
 
-        st.markdown("### Mapping đã duyệt")
-        approved_map_df = pd.DataFrame(
-            [{"Original": k, "Suggested": v} for k, v in st.session_state["approved_mapping"].items()]
-        )
-        st.dataframe(approved_map_df, use_container_width=True)
+    st.markdown("### 🧾 Giải thích các file")
 
-        csv_full = convert_df(merged_final)
+    st.markdown("""
+**1. Merged đầy đủ (CSV)**  
+→ Dữ liệu sau khi ghép ISI + Scopus và đã chuẩn hóa  
+→ Dùng để lưu trữ hoặc phân tích tiếp  
+
+**2. File chuẩn cho VOSviewer (CSV)**  
+→ Dùng trực tiếp để import vào VOSviewer  
+→ Đã chuẩn hóa từ khóa và áp mapping  
+
+**3. Bảng chỉnh sửa mapping (CSV)**  
+→ File bạn đã chỉnh trên web  
+→ Dùng để chỉnh sửa thêm hoặc lưu lại quá trình làm việc  
+
+**4. Mapping đã duyệt (CSV)**  
+→ Danh sách từ khóa đã gộp cuối cùng  
+→ Có thể dùng làm thesaurus cho nghiên cứu sau  
+""")
+
+    # =========================
+    # TẠO FILE
+    # =========================
+    csv_full = convert_df(merged_final)
+
+    vos_df = create_vosviewer_export(merged_final, keyword_mode=keyword_mode)
+    csv_vos = convert_df(vos_df)
+
+    mapping_export_df = st.session_state["mapping_editor_df"].copy()
+    csv_mapping = convert_df(mapping_export_df)
+
+    approved_map_df = pd.DataFrame(
+        [{"Original": k, "Suggested": v} for k, v in st.session_state["approved_mapping"].items()]
+    )
+    csv_approved = convert_df(approved_map_df)
+
+    st.markdown("### 📦 Tải file")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
         st.download_button(
-            "📥 Tải file merged đầy đủ (CSV)",
+            "Merged",
             data=csv_full,
-            file_name="merged_isi_scopus_keywords_final.csv",
-            mime="text/csv",
-            use_container_width=True
+            file_name="merged_data.csv"
         )
 
-        vos_df = create_vosviewer_export(merged_final, keyword_mode=keyword_mode)
-        csv_vos = convert_df(vos_df)
+    with col2:
         st.download_button(
-            "📥 Tải file chuẩn cho VOSviewer (CSV)",
+            "VOSviewer",
             data=csv_vos,
-            file_name=f"vosviewer_ready_{keyword_mode.lower()}_final.csv",
-            mime="text/csv",
-            use_container_width=True
+            file_name="vosviewer_ready.csv"
         )
 
-        mapping_export_df = st.session_state["mapping_editor_df"].copy()
-        csv_mapping = convert_df(mapping_export_df)
+    with col3:
         st.download_button(
-            "📥 Tải bảng chỉnh sửa mapping (CSV)",
+            "Mapping table",
             data=csv_mapping,
-            file_name="keyword_mapping_editor_table.csv",
-            mime="text/csv",
-            use_container_width=True
+            file_name="mapping_editor.csv"
         )
 
-        csv_approved = convert_df(approved_map_df)
+    with col4:
         st.download_button(
-            "📥 Tải mapping đã duyệt (CSV)",
+            "Approved",
             data=csv_approved,
-            file_name="approved_keyword_mapping.csv",
-            mime="text/csv",
-            use_container_width=True
+            file_name="approved_mapping.csv"
         )
 
-        st.subheader("Xem trước file VOSviewer")
-        st.dataframe(vos_df.head(20), use_container_width=True)
+    # =========================
+    # HIỂN THỊ MAPPING NHỎ GỌN
+    # =========================
+    st.markdown("### 🔎 Mapping đã duyệt")
 
-    except Exception as e:
-        st.error(f"Lỗi khi xử lý dữ liệu: {e}")
+    if not approved_map_df.empty:
+        st.dataframe(approved_map_df, height=200, use_container_width=True)
+    else:
+        st.caption("Chưa có mapping nào được chọn.")
+      
